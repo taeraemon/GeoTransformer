@@ -9,3 +9,8 @@ weights/*
 pretrained
 data/Kitti/downsampled
 data/ModelNet/*.pkl
+
+# tykim
+# ================================
+env*/
+# ================================
