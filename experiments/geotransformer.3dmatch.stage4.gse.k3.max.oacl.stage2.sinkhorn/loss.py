@@ -137,7 +137,13 @@ class Evaluator(nn.Module):
 
         rre, rte = isotropic_transform_error(transform, est_transform)
 
-        realignment_transform = torch.matmul(torch.inverse(transform), est_transform)
+        # ================================
+        # realignment_transform = torch.matmul(torch.inverse(transform), est_transform)
+        # --------------------------------
+        # gpu가 아닌 cpu에서 구동
+        inv_transform = torch.inverse(transform.cpu()).to(transform.device)
+        realignment_transform = torch.matmul(inv_transform, est_transform)
+        # ================================
         realigned_src_points_f = apply_transform(src_points, realignment_transform)
         rmse = torch.linalg.norm(realigned_src_points_f - src_points, dim=1).mean()
         recall = torch.lt(rmse, self.acceptance_rmse).float()
