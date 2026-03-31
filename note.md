@@ -1,6 +1,7 @@
 - 가상환경 및 개발환경 셋업
 
 ```
+# CUDA 11.3 기준
 pyenv global 3.8.20
 
 python3 -m venv env
@@ -8,7 +9,6 @@ source env/bin/activate
 
 export SKLEARN_ALLOW_DEPRECATED_SKLEARN_PACKAGE_INSTALL=True
 pip install --upgrade pip
-pip install torch==1.7.1+cu110 -f https://download.pytorch.org/whl/torch_stable.html
 pip install torch==1.7.1+cu110 -f https://download.pytorch.org/whl/torch_stable.html
 pip install -r requirements.txt
 pip install typeguard
@@ -32,15 +32,18 @@ https://github.com/qinzheng93/GeoTransformer/releases
 
 ```
 cd experiments/geotransformer.3dmatch.stage4.gse.k3.max.oacl.stage2.sinkhorn
-CUDA_LAUNCH_BLOCKING=1 CUDA_VISIBLE_DEVICES=0 python demo.py   --src_file=../../data/demo/src.npy   --ref_file=../../data/demo/ref.npy   --gt_file=../../data/demo/gt.npy   --weights=../../weights/geotransformer-3dmatch.pth.tar
 
-CUDA_LAUNCH_BLOCKING=1 CUDA_VISIBLE_DEVICES=0 python demo.py   --src_file=../../data/demo/src.npy   --ref_file=../../data/demo/ref.npy   --gt_file=../../data/demo/gt.npy   --weights=../../output/geotransformer.3dmatch.stage4.gse.k3.max.oacl.stage2.sinkhorn/snapshots/epoch-2.pth.tar
+CUDA_LAUNCH_BLOCKING=1 CUDA_VISIBLE_DEVICES=0 python demo.py \
+--src_file=../../data/demo/src.npy \
+--ref_file=../../data/demo/ref.npy \
+--gt_file=../../data/demo/gt.npy \
+--weights=../../weights/geotransformer-3dmatch.pth.tar
 
-CUDA_VISIBLE_DEVICES=0 python demo.py \
-  --src_file=../../data/demo/src.npy \
-  --ref_file=../../data/demo/ref.npy \
-  --weights=../../output/geotransformer.3dmatch.stage4.gse.k3.max.oacl.stage2.sinkhorn/snapshots/epoch-2.pth.tar
-
+CUDA_LAUNCH_BLOCKING=1 CUDA_VISIBLE_DEVICES=0 python demo.py \
+--src_file=../../data/demo/src.npy \
+--ref_file=../../data/demo/ref.npy \
+--gt_file=../../data/demo/gt.npy \
+--weights=../../output/geotransformer.3dmatch.stage4.gse.k3.max.oacl.stage2.sinkhorn/snapshots/epoch-2.pth.tar
 
 RRE(deg): 0.645, RTE(m): 0.025
 ```
@@ -94,3 +97,27 @@ CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.launch --nproc_per_node=2 t
 ```
 
 loss.py에서 오류나서 [loss.py](http://loss.py) 수정 (inverse를 cpu에서 하도록)
+
+ 
+
+- 벤치마크 테스트
+
+특정 weight에 대해서 벤치마크 수행
+
+```
+cd experiments/geotransformer.3dmatch.stage4.gse.k3.max.oacl.stage2.sinkhorn
+
+# 1) pretrained로 feature(.npz) 생성 (벤치마크는 3DMatch 또는 3DLoMatch)
+CUDA_VISIBLE_DEVICES=0 python test.py \
+--snapshot ../../weights/geotransformer-3dmatch.pth.tar \
+--benchmark 3DMatch
+
+# 2) 생성된 feature를 읽어서 평가
+CUDA_VISIBLE_DEVICES=0 python eval.py \
+--benchmark 3DMatch \
+--method lgr
+
+Registration, RR: 0.925, mean_RRE: 1.811, mean_RTE: 0.063, median_RRE: 1.534, median_RTE: 0.051
+Registration, RR: 0.742, mean_RRE: 2.944, mean_RTE: 0.090, median_RRE: 2.588, median_RTE: 0.073
+```
+
