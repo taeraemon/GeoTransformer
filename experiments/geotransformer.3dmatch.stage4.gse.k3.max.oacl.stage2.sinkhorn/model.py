@@ -1,3 +1,5 @@
+import time
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -14,6 +16,25 @@ from geotransformer.modules.geotransformer import (
 )
 
 from backbone import KPConvFPN
+
+
+def _synchronize_if_needed():
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def _start_timer(enabled):
+    if not enabled:
+        return None
+    _synchronize_if_needed()
+    return time.perf_counter()
+
+
+def _stop_timer(enabled, timings, key, start_time):
+    if not enabled or start_time is None:
+        return
+    _synchronize_if_needed()
+    timings[key] = time.perf_counter() - start_time
 
 
 class GeoTransformer(nn.Module):
@@ -68,8 +89,12 @@ class GeoTransformer(nn.Module):
 
     def forward(self, data_dict):
         output_dict = {}
+        profile_runtime = data_dict.get('_profile_runtime', False)
+        module_timings = {}
+        forward_start_time = _start_timer(profile_runtime)
 
         # Downsample point clouds
+        stage_start_time = _start_timer(profile_runtime)
         feats = data_dict['features'].detach()
         transform = data_dict['transform'].detach()
 
@@ -93,8 +118,10 @@ class GeoTransformer(nn.Module):
         output_dict['src_points_f'] = src_points_f
         output_dict['ref_points'] = ref_points
         output_dict['src_points'] = src_points
+        _stop_timer(profile_runtime, module_timings, 'input_unpack', stage_start_time)
 
         # 1. Generate ground truth node correspondences
+        stage_start_time = _start_timer(profile_runtime)
         _, ref_node_masks, ref_node_knn_indices, ref_node_knn_masks = point_to_node_partition(
             ref_points_f, ref_points_c, self.num_points_in_patch
         )
@@ -106,7 +133,9 @@ class GeoTransformer(nn.Module):
         src_padded_points_f = torch.cat([src_points_f, torch.zeros_like(src_points_f[:1])], dim=0)
         ref_node_knn_points = index_select(ref_padded_points_f, ref_node_knn_indices, dim=0)
         src_node_knn_points = index_select(src_padded_points_f, src_node_knn_indices, dim=0)
+        _stop_timer(profile_runtime, module_timings, 'point_partition', stage_start_time)
 
+        stage_start_time = _start_timer(profile_runtime)
         gt_node_corr_indices, gt_node_corr_overlaps = get_node_correspondences(
             ref_points_c,
             src_points_c,
@@ -122,14 +151,18 @@ class GeoTransformer(nn.Module):
 
         output_dict['gt_node_corr_indices'] = gt_node_corr_indices
         output_dict['gt_node_corr_overlaps'] = gt_node_corr_overlaps
+        _stop_timer(profile_runtime, module_timings, 'gt_correspondence', stage_start_time)
 
         # 2. KPFCNN Encoder
+        stage_start_time = _start_timer(profile_runtime)
         feats_list = self.backbone(feats, data_dict)
+        _stop_timer(profile_runtime, module_timings, 'kpconv_backbone', stage_start_time)
 
         feats_c = feats_list[-1]
         feats_f = feats_list[0]
 
         # 3. Conditional Transformer
+        stage_start_time = _start_timer(profile_runtime)
         ref_feats_c = feats_c[:ref_length_c]
         src_feats_c = feats_c[ref_length_c:]
         ref_feats_c, src_feats_c = self.transformer(
@@ -143,6 +176,7 @@ class GeoTransformer(nn.Module):
 
         output_dict['ref_feats_c'] = ref_feats_c_norm
         output_dict['src_feats_c'] = src_feats_c_norm
+        _stop_timer(profile_runtime, module_timings, 'geometric_transformer', stage_start_time)
 
         # 5. Head for fine level matching
         ref_feats_f = feats_f[:ref_length_f]
@@ -151,6 +185,7 @@ class GeoTransformer(nn.Module):
         output_dict['src_feats_f'] = src_feats_f
 
         # 6. Select topk nearest node correspondences
+        stage_start_time = _start_timer(profile_runtime)
         with torch.no_grad():
             ref_node_corr_indices, src_node_corr_indices, node_corr_scores = self.coarse_matching(
                 ref_feats_c_norm, src_feats_c_norm, ref_node_masks, src_node_masks
@@ -164,8 +199,10 @@ class GeoTransformer(nn.Module):
                 ref_node_corr_indices, src_node_corr_indices, node_corr_scores = self.coarse_target(
                     gt_node_corr_indices, gt_node_corr_overlaps
                 )
+        _stop_timer(profile_runtime, module_timings, 'coarse_matching', stage_start_time)
 
         # 7.2 Generate batched node points & feats
+        stage_start_time = _start_timer(profile_runtime)
         ref_node_corr_knn_indices = ref_node_knn_indices[ref_node_corr_indices]  # (P, K)
         src_node_corr_knn_indices = src_node_knn_indices[src_node_corr_indices]  # (P, K)
         ref_node_corr_knn_masks = ref_node_knn_masks[ref_node_corr_indices]  # (P, K)
@@ -182,15 +219,19 @@ class GeoTransformer(nn.Module):
         output_dict['src_node_corr_knn_points'] = src_node_corr_knn_points
         output_dict['ref_node_corr_knn_masks'] = ref_node_corr_knn_masks
         output_dict['src_node_corr_knn_masks'] = src_node_corr_knn_masks
+        _stop_timer(profile_runtime, module_timings, 'fine_patch_gather', stage_start_time)
 
         # 8. Optimal transport
+        stage_start_time = _start_timer(profile_runtime)
         matching_scores = torch.einsum('bnd,bmd->bnm', ref_node_corr_knn_feats, src_node_corr_knn_feats)  # (P, K, K)
         matching_scores = matching_scores / feats_f.shape[1] ** 0.5
         matching_scores = self.optimal_transport(matching_scores, ref_node_corr_knn_masks, src_node_corr_knn_masks)
 
         output_dict['matching_scores'] = matching_scores
+        _stop_timer(profile_runtime, module_timings, 'optimal_transport', stage_start_time)
 
         # 9. Generate final correspondences during testing
+        stage_start_time = _start_timer(profile_runtime)
         with torch.no_grad():
             if not self.fine_matching.use_dustbin:
                 matching_scores = matching_scores[:, :-1, :-1]
@@ -208,6 +249,11 @@ class GeoTransformer(nn.Module):
             output_dict['src_corr_points'] = src_corr_points
             output_dict['corr_scores'] = corr_scores
             output_dict['estimated_transform'] = estimated_transform
+        _stop_timer(profile_runtime, module_timings, 'fine_matching', stage_start_time)
+
+        _stop_timer(profile_runtime, module_timings, 'forward_total', forward_start_time)
+        if profile_runtime:
+            output_dict['module_timings'] = module_timings
 
         return output_dict
 

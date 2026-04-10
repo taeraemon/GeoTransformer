@@ -1,4 +1,6 @@
 import argparse
+import time
+from collections import OrderedDict
 
 import torch
 import numpy as np
@@ -41,35 +43,115 @@ def load_data(args):
     return data_dict
 
 
+def synchronize_cuda():
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def get_peak_vram_mib():
+    if not torch.cuda.is_available():
+        return None
+    return torch.cuda.max_memory_allocated() / (1024.0 ** 2)
+
+
+def timed_call(fn):
+    synchronize_cuda()
+    start_time = time.perf_counter()
+    result = fn()
+    synchronize_cuda()
+    return result, time.perf_counter() - start_time
+
+
+def format_timing_name(name):
+    if name.endswith("_total"):
+        name = name[:-6] + " total"
+    return name.replace("_", " ")
+
+
+def print_timing_table(title, label_name, timings, total_key):
+    if not timings:
+        return
+
+    total_time = timings.get(total_key, 0.0)
+    rows = []
+    for key, elapsed in timings.items():
+        display_name = format_timing_name(key)
+        if key == total_key:
+            display_name = display_name.upper()
+        elapsed_ms_str = f"{elapsed * 1000.0:,.3f}"
+        share_str = f"{0.0 if total_time <= 0 else elapsed / total_time * 100.0:.2f}%"
+        rows.append((display_name, elapsed_ms_str, share_str))
+
+    name_width = max(len(label_name), max(len(name) for name, _, _ in rows))
+    time_width = max(len("Time (ms)"), max(len(elapsed_ms) for _, elapsed_ms, _ in rows))
+    share_width = max(len("Share"), max(len(share) for _, _, share in rows))
+
+    print()
+    print("=" * (name_width + time_width + share_width + 6))
+    print(title)
+    print("=" * (name_width + time_width + share_width + 6))
+    print(f"{label_name:<{name_width}}  {'Time (ms)':>{time_width}}  {'Share':>{share_width}}")
+    print(f"{'-' * name_width}  {'-' * time_width}  {'-' * share_width}")
+    for name, elapsed_ms, share in rows:
+        print(f"{name:<{name_width}}  {elapsed_ms:>{time_width}}  {share:>{share_width}}")
+
+
 def main():
     parser = make_parser()
     args = parser.parse_args()
 
     cfg = make_cfg()
+    inference_timings = OrderedDict()
+    inference_start_time = time.perf_counter()
 
     # prepare data
-    data_dict = load_data(args)
+    data_dict, inference_timings["data_loading"] = timed_call(lambda: load_data(args))
     neighbor_limits = [38, 36, 36, 38]  # default setting in 3DMatch
-    data_dict = registration_collate_fn_stack_mode(
-        [data_dict], cfg.backbone.num_stages, cfg.backbone.init_voxel_size, cfg.backbone.init_radius, neighbor_limits
+    data_dict, inference_timings["batch_preparation"] = timed_call(
+        lambda: registration_collate_fn_stack_mode(
+            [data_dict], cfg.backbone.num_stages, cfg.backbone.init_voxel_size, cfg.backbone.init_radius, neighbor_limits
+        )
     )
 
     # prepare model
-    model = create_model(cfg).cuda()
-    state_dict = torch.load(args.weights)
-    model.load_state_dict(state_dict["model"])
+    def build_model():
+        model = create_model(cfg).cuda()
+        state_dict = torch.load(args.weights)
+        model.load_state_dict(state_dict["model"])
+        model.eval()
+        return model
+
+    model, inference_timings["model_setup"] = timed_call(build_model)
 
     # prediction
-    data_dict = to_cuda(data_dict)
-    output_dict = model(data_dict)
-    data_dict = release_cuda(data_dict)
-    output_dict = release_cuda(output_dict)
+    def move_data_to_cuda():
+        cuda_data_dict = to_cuda(data_dict)
+        cuda_data_dict["_profile_runtime"] = True
+        return cuda_data_dict
+
+    data_dict, inference_timings["to_cuda"] = timed_call(move_data_to_cuda)
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+    output_dict, inference_timings["model_forward"] = timed_call(lambda: model(data_dict))
+    model_forward_vram_mib = get_peak_vram_mib()
+    model_timings = output_dict.get("module_timings", {})
+    data_dict, inference_timings["release_input"] = timed_call(lambda: release_cuda(data_dict))
+    output_dict, inference_timings["release_output"] = timed_call(lambda: release_cuda(output_dict))
 
     # get results
-    ref_points = output_dict["ref_points"]
-    src_points = output_dict["src_points"]
-    estimated_transform = output_dict["estimated_transform"]
-    transform = data_dict["transform"]
+    def unpack_results():
+        return (
+            output_dict["ref_points"],
+            output_dict["src_points"],
+            output_dict["estimated_transform"],
+            data_dict["transform"],
+        )
+
+    (ref_points, src_points, estimated_transform, transform), inference_timings["result_unpack"] = timed_call(unpack_results)
+    inference_timings["inference_total"] = time.perf_counter() - inference_start_time
+
+    print_timing_table("Inference Timing Summary", "Stage", inference_timings, "inference_total")
+    print_timing_table("Model Forward Breakdown", "Module", model_timings, "forward_total")
 
     # visualization
     ref_pcd = make_open3d_point_cloud(ref_points)
@@ -85,6 +167,8 @@ def main():
     # compute error
     rre, rte = compute_registration_error(transform, estimated_transform)
     print(f"RRE(deg): {rre:.3f}, RTE(m): {rte:.3f}")
+    if model_forward_vram_mib is not None:
+        print(f"Model Forward VRAM: {model_forward_vram_mib:.2f} MiB")
 
 
 if __name__ == "__main__":
